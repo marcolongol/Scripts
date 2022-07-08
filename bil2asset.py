@@ -5,6 +5,7 @@ author: Lucas Marcolongo
 email: lucas@marcolongo.dev
 """
 import argparse
+import asyncio
 import shutil
 import sys
 from abc import ABC
@@ -20,6 +21,10 @@ SUPPORTED_RASTERIO_FORMATS = rasterio.drivers.raster_driver_extensions().keys()
 
 # enum for supported teoco asset map data formats
 class SUPPORTED_ASSET(Enum):
+    """
+    Enum for supported asset map data formats
+    """
+
     DLU = "dlu"
     DTM = "dtm"
 
@@ -40,32 +45,42 @@ class Converter(ABC):
         self.type = type
         self.input_format: SUPPORTED_RASTERIO_FORMATS = input_file.suffix[-3:]
 
-    def convert(self):
+    async def convert(self):
         """
         Convert the input file to the output file.
         """
+        with rasterio.open(self.input_file) as src:
+            await self._convert_array(src)
+            await self._generate_index(src)
+            self._fix_header()
+        print(f"Converted {self.input_file} to {self.output_file}.")
+
+    async def _convert_array(self, src: rasterio.DatasetReader):
+        """
+        Convert the input array to a numpy array and set the nodata value.
+        """
+        # read the input dataset, check if it has a valid crs, convert it to a numpy array and set the nodata value
         # nodata value is 0 for DLU and -9999 for DTM
         nodata_value = 0 if self.type == SUPPORTED_ASSET.DLU else -9999
-
-        # read the input dataset, check if it has a valid crs, convert it to a numpy array and set the nodata value
-        with rasterio.open(self.input_file) as src:
-            if src.crs is None:
-                raise ValueError(f"Input file {self.input_file} has no crs.")
-            data = src.read(1)
-            data[data == src.nodata] = nodata_value
-            # convert to signed 16-bit integer (asset format)
-            data = np.array(data).astype(">i2")
-            # update dest metadata
-            dest_meta = src.meta.copy()
-            dest_meta.update(
-                dtype=rasterio.int16,
-                nodata=nodata_value,
-            )
+        if src.crs is None:
+            raise ValueError(f"Input file {self.input_file} has no crs.")
+        data = src.read(1)
+        data[data == src.nodata] = nodata_value
+        # convert to signed 16-bit integer (asset format)
+        data = np.array(data).astype(">i2")
+        # update dest metadata
+        dest_meta = src.meta.copy()
+        dest_meta.update(
+            dtype=rasterio.int16,
+            nodata=nodata_value,
+        )
         # save to output file
         with rasterio.open(self.output_file, "w", **dest_meta):
             pass
         # use numpy .tofile to ensure right endianess
         data.tofile(self.output_file)
+
+    def _fix_header(self):
         # update "BYTEORDER=I" to "BYTEORDER=M" line in the header file
         with open(str(self.output_file) + ".hdr", "r") as f:
             lines = f.readlines()
@@ -75,6 +90,8 @@ class Converter(ABC):
                     f.write("BYTEORDER=M\n")
                 else:
                     f.write(line)
+
+    async def _generate_index(self, src: rasterio.DatasetReader):
         # generate index.txt file in the format: <filename> <easting_min> <easting_max> <northing_min> <northing_max> <resolution>
         with open(self.output_file.parent / "index.txt", "w") as f:
             f.write(
@@ -84,7 +101,6 @@ class Converter(ABC):
         if self.type == SUPPORTED_ASSET.DLU:
             for mnu_file in self.input_file.parent.glob(".mnu"):
                 shutil.copy(mnu_file, self.output_file.parent)
-        print(f"Converted {self.input_file} to {self.output_file}.")
 
     def validate(self):
         """
@@ -124,7 +140,7 @@ class Converter(ABC):
         Validates all inputs and run the converter.
         """
         self.validate()
-        self.convert()
+        asyncio.run(self.convert())
 
 
 # main function (parse args, create converter and run it)
